@@ -1,4 +1,4 @@
-yt-dlp>=2024.12.06
+yt-dlp
 flask>=3.0.0
 gunicorn>=21.2.0
 supabase>=2.0.0
