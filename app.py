@@ -39,7 +39,7 @@ def download():
         with tempfile.TemporaryDirectory() as tmpdir:
             # Latest working config for Dec 2024 - ios,mweb clients
             ydl_opts = {
-                'format': 'best[height<=720]/bestvideo[height<=720]+bestaudio/best' if media_type == 'video' else 'bestaudio/best',
+               'format': 'best/bestvideo+bestaudio' if media_type == 'video' else 'bestaudio/best',
                 'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
                 'quiet': False,
                 'no_warnings': False,
