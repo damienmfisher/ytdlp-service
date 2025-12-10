@@ -1,94 +1,73 @@
-import os
-import tempfile
-import requests
 from flask import Flask, request, jsonify
-from supabase import create_client
 import yt_dlp
+import os
+import requests
+import tempfile
+import logging
+from supabase import create_client, Client
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-# Environment variables
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_KEY')
 API_SECRET = os.environ.get('API_SECRET')
 PROXY_URL = os.environ.get('PROXY_URL')
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({
-        'status': 'healthy',
-        'proxy_configured': bool(PROXY_URL),
-        'supabase_configured': bool(SUPABASE_URL and SUPABASE_KEY)
-    })
+    return jsonify({'status': 'ok', 'version': '2.1.0-ios-mweb'})
 
 @app.route('/download', methods=['POST'])
 def download():
     data = request.json
-    
-    # Validate secret
-    if data.get('secret') != API_SECRET:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     url = data.get('url')
-    media_type = data.get('type', 'audio')  # 'audio' or 'video'
+    media_type = data.get('type', 'audio')
     asset_id = data.get('asset_id')
     artist_id = data.get('artist_id')
+    secret = data.get('secret')
     callback_url = data.get('callback_url')
+    upload_url = data.get('upload_url')
     
-    if not url or not asset_id:
-        return jsonify({'error': 'Missing required fields'}), 400
+    if secret != API_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
     
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            # yt-dlp options with mweb extractor for better YouTube compatibility
+            # Latest working config for Dec 2024 - ios,mweb clients
             ydl_opts = {
-                'format': 'bestaudio/best' if media_type == 'audio' else 'best[height<=480]/worst',
+                'format': 'best[height<=720]/bestvideo[height<=720]+bestaudio/best' if media_type == 'video' else 'bestaudio/best',
                 'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
                 'quiet': False,
                 'no_warnings': False,
-                'retries': 15,
-                'fragment_retries': 15,
-                'file_access_retries': 10,
-                'extractor_retries': 10,
-                'socket_timeout': 120,
-                'sleep_interval': 3,
-                'max_sleep_interval': 10,
-                'sleep_interval_requests': 2,
-                'geo_bypass': True,
-                'geo_bypass_country': 'US',
-                'nocheckcertificate': True,
-                # Use mweb (mobile web) player - often less restricted
+                'ignoreerrors': False,
+                'retries': 10,
+                'fragment_retries': 10,
+                'file_access_retries': 5,
+                'extractor_retries': 5,
+                'socket_timeout': 60,
+                'http_chunk_size': 10485760,
+                # CRITICAL: Use ios,mweb as per latest yt-dlp fix
                 'extractor_args': {
                     'youtube': {
-                        'player_client': ['mweb', 'android', 'ios'],
+                        'player_client': ['ios', 'mweb'],
                         'player_skip': ['webpage', 'configs'],
                     }
                 },
-                # Mobile browser headers
                 'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'User-Agent': 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+                    'Accept': '*/*',
                     'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Fetch-User': '?1',
-                    'Cache-Control': 'max-age=0',
                 },
             }
             
-            # Add proxy if configured
             if PROXY_URL:
                 ydl_opts['proxy'] = PROXY_URL
-                print(f"Using proxy: {PROXY_URL[:30]}...")
+                logger.info(f"Using proxy: {PROXY_URL[:30]}...")
             
-            # Add audio extraction for audio type
             if media_type == 'audio':
                 ydl_opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
@@ -96,82 +75,74 @@ def download():
                     'preferredquality': '192',
                 }]
             
-            # Download with yt-dlp
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 title = info.get('title', 'Unknown')
                 duration = info.get('duration', 0)
                 
                 # Find downloaded file
-                downloaded_file = None
-                for f in os.listdir(tmpdir):
-                    downloaded_file = os.path.join(tmpdir, f)
-                    break
+                ext = 'mp3' if media_type == 'audio' else info.get('ext', 'mp4')
+                filename = os.path.join(tmpdir, f"{info['id']}.{ext}")
                 
-                if not downloaded_file:
-                    raise Exception("No file downloaded")
+                if not os.path.exists(filename):
+                    for f in os.listdir(tmpdir):
+                        if f.startswith(info['id']):
+                            filename = os.path.join(tmpdir, f)
+                            break
                 
-                # Determine file extension and bucket
-                ext = os.path.splitext(downloaded_file)[1].lower()
-                if media_type == 'audio':
-                    bucket = 'audio-files'
-                    storage_path = f"{artist_id}/{asset_id}.mp3"
-                else:
-                    bucket = 'media-assets'
-                    storage_path = f"{artist_id}/videos/{asset_id}{ext}"
-                
-                # Upload to Supabase Storage
-                with open(downloaded_file, 'rb') as f:
+                # Upload to Supabase Storage via signed URL
+                with open(filename, 'rb') as f:
                     file_data = f.read()
                 
-                supabase.storage.from_(bucket).upload(
-                    storage_path,
-                    file_data,
-                    {'content-type': 'audio/mpeg' if media_type == 'audio' else 'video/mp4'}
+                upload_response = requests.put(
+                    upload_url,
+                    data=file_data,
+                    headers={'Content-Type': 'video/mp4' if media_type == 'video' else 'audio/mpeg'}
                 )
                 
-                # Get public URL
-                public_url = supabase.storage.from_(bucket).get_public_url(storage_path)
+                if upload_response.status_code not in [200, 201]:
+                    raise Exception(f"Upload failed: {upload_response.status_code}")
                 
-                # Send callback with results
+                # Construct public URL
+                bucket = 'media-assets' if media_type == 'video' else 'audio-files'
+                file_path = f"{artist_id}/{asset_id}.{'mp4' if media_type == 'video' else 'mp3'}"
+                asset_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{file_path}"
+                
+                # Send callback
                 if callback_url:
-                    callback_data = {
+                    requests.post(callback_url, json={
                         'asset_id': asset_id,
                         'status': 'ready',
-                        'asset_url': public_url,
+                        'asset_url': asset_url,
                         'title': title,
                         'duration': duration,
-                        'secret': API_SECRET
-                    }
-                    requests.post(callback_url, json=callback_data, timeout=30)
+                        'secret': secret
+                    }, timeout=30)
                 
                 return jsonify({
                     'success': True,
                     'asset_id': asset_id,
                     'title': title,
-                    'duration': duration,
-                    'url': public_url
+                    'duration': duration
                 })
                 
     except Exception as e:
-        error_message = str(e)
-        print(f"ERROR: {error_message}")
+        error_msg = str(e)
+        logger.error(f"Download failed: {error_msg}")
         
-        # Send error callback
+        # Send failure callback
         if callback_url:
-            callback_data = {
-                'asset_id': asset_id,
-                'status': 'failed',
-                'error_message': error_message,
-                'secret': API_SECRET
-            }
             try:
-                requests.post(callback_url, json=callback_data, timeout=30)
+                requests.post(callback_url, json={
+                    'asset_id': asset_id,
+                    'status': 'failed',
+                    'error_message': error_msg,
+                    'secret': secret
+                }, timeout=30)
             except:
                 pass
         
-        return jsonify({'error': error_message, 'assetId': asset_id}), 500
+        return jsonify({'error': error_msg, 'assetId': asset_id}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
