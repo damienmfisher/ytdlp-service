@@ -3,16 +3,29 @@ import yt_dlp
 import os
 import tempfile
 import traceback
+import requests  # NEW: For callback requests
 from supabase import create_client
 
 app = Flask(__name__)
 
-# Initialize Supabase client
+# Initialize Supabase client (only needed for Storage uploads now)
 supabase_url = os.environ.get('SUPABASE_URL')
 supabase_key = os.environ.get('SUPABASE_SERVICE_KEY')
 api_secret = os.environ.get('API_SECRET')
-
 supabase = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
+
+
+def send_callback(callback_url, payload):
+    """Send status update to Lovable edge function"""
+    try:
+        print(f"📞 Sending callback to {callback_url}: {payload.get('status')}")
+        response = requests.post(callback_url, json=payload, timeout=30)
+        print(f"📞 Callback response: {response.status_code}")
+        return response.status_code == 200
+    except Exception as e:
+        print(f"❌ Callback failed: {e}")
+        return False
+
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -21,6 +34,7 @@ def health():
         'status': 'ok',
         'supabase_configured': supabase is not None
     })
+
 
 @app.route('/download', methods=['POST'])
 def download():
@@ -33,33 +47,40 @@ def download():
         "type": "audio" | "video",
         "asset_id": "uuid-of-media-asset",
         "artist_id": "uuid-of-artist",
-        "secret": "your-api-secret"
+        "secret": "your-api-secret",
+        "callback_url": "https://xxx.supabase.co/functions/v1/media-callback"  # NEW!
     }
     """
+    data = request.json or {}
+    callback_url = data.get('callback_url')  # NEW: Get callback URL
+    asset_id = data.get('asset_id')
+    
     try:
-        data = request.json
-        
         # Validate secret
         if data.get('secret') != api_secret:
             return jsonify({'error': 'Unauthorized'}), 401
         
         url = data.get('url')
         media_type = data.get('type', 'audio')  # 'audio' or 'video'
-        asset_id = data.get('asset_id')
         artist_id = data.get('artist_id')
         
         if not url or not asset_id or not artist_id:
             return jsonify({'error': 'Missing required fields: url, asset_id, artist_id'}), 400
         
+        if not callback_url:
+            return jsonify({'error': 'Missing callback_url'}), 400
+        
         if not supabase:
-            return jsonify({'error': 'Supabase not configured'}), 500
+            return jsonify({'error': 'Supabase not configured (needed for storage)'}), 500
         
         print(f"📥 Starting download: {url} as {media_type}")
         
-        # Update status to downloading
-        supabase.table('media_assets').update({
-            'status': 'downloading'
-        }).eq('id', asset_id).execute()
+        # Send "downloading" status via callback (NOT direct Supabase)
+        send_callback(callback_url, {
+            'asset_id': asset_id,
+            'status': 'downloading',
+            'secret': api_secret
+        })
         
         # Create temp directory for this download
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -122,7 +143,7 @@ def download():
             file_size = os.path.getsize(downloaded_file)
             print(f"📁 File size: {file_size / 1024 / 1024:.2f} MB")
             
-            # Upload to Supabase Storage
+            # Upload to Supabase Storage (this still uses Supabase client)
             storage_path = f"{artist_id}/{asset_id}.{expected_ext}"
             
             print(f"☁️ Uploading to {bucket}/{storage_path}")
@@ -140,24 +161,22 @@ def download():
             
             print(f"✅ Uploaded! URL: {public_url}")
             
-            # Update media_assets record
-            update_data = {
-                'asset_url': public_url,
-                'title': title[:255] if title else None,  # Truncate long titles
-                'duration_seconds': min(duration, 86400) if duration else None,  # Cap at 24 hours
+            # Send SUCCESS callback (NOT direct Supabase update)
+            callback_payload = {
+                'asset_id': asset_id,
                 'status': 'ready',
-                'asset_type': asset_type,
-                'source_url': url,
-                'source_type': 'youtube' if 'youtube' in url or 'youtu.be' in url else 'soundcloud',
-                'error_message': None
+                'asset_url': public_url,
+                'title': title[:255] if title else None,
+                'duration': min(duration, 86400) if duration else None,
+                'secret': api_secret
             }
             
             if thumbnail:
-                update_data['thumbnail_url'] = thumbnail
+                callback_payload['thumbnail_url'] = thumbnail
             
-            supabase.table('media_assets').update(update_data).eq('id', asset_id).execute()
+            send_callback(callback_url, callback_payload)
             
-            print(f"✅ Database updated for asset {asset_id}")
+            print(f"✅ Callback sent for asset {asset_id}")
             
             return jsonify({
                 'success': True,
@@ -166,20 +185,23 @@ def download():
                 'duration': duration,
                 'file_size': file_size
             })
-            
+    
     except Exception as e:
         error_msg = str(e)[:500]
         print(f"❌ Error: {error_msg}")
         print(traceback.format_exc())
         
-        # Update media_assets with error
-        if supabase and data.get('asset_id'):
-            supabase.table('media_assets').update({
+        # Send FAILURE callback (NOT direct Supabase update)
+        if callback_url and asset_id:
+            send_callback(callback_url, {
+                'asset_id': asset_id,
                 'status': 'failed',
-                'error_message': error_msg
-            }).eq('id', data.get('asset_id')).execute()
+                'error_message': error_msg,
+                'secret': api_secret
+            })
         
         return jsonify({'error': error_msg}), 500
+
 
 @app.route('/info', methods=['POST'])
 def get_info():
@@ -218,9 +240,10 @@ def get_info():
                 'view_count': info.get('view_count'),
                 'formats_available': len(info.get('formats', []))
             })
-            
+    
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
