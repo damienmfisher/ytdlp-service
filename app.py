@@ -1,238 +1,161 @@
-from flask import Flask, request, jsonify
-import yt_dlp
 import os
 import tempfile
-import traceback
 import requests
+from flask import Flask, request, jsonify
+from supabase import create_client, Client
+import yt_dlp
 
 app = Flask(__name__)
 
-# Only need API secret for authorization
-api_secret = os.environ.get('API_SECRET')
+# Environment variables
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_KEY')
+API_SECRET = os.environ.get('API_SECRET')
+PROXY_URL = os.environ.get('PROXY_URL')  # NEW: Oxylabs proxy
 
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def send_callback(callback_url, payload):
-    """Send status update to Lovable edge function"""
+def send_callback(callback_url, data):
+    """Send status update to Lovable callback endpoint"""
     try:
-        print(f"📞 Sending callback to {callback_url}: {payload.get('status')}")
-        response = requests.post(callback_url, json=payload, timeout=30)
-        print(f"📞 Callback response: {response.status_code}")
-        return response.status_code == 200
+        requests.post(callback_url, json=data, timeout=30)
     except Exception as e:
-        print(f"❌ Callback failed: {e}")
-        return False
-
+        print(f"Callback failed: {e}")
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'ok',
-        'api_secret_configured': api_secret is not None
-    })
-
+    return jsonify({"status": "ok", "proxy_configured": bool(PROXY_URL)})
 
 @app.route('/download', methods=['POST'])
 def download():
-    """
-    Download audio or video from YouTube/SoundCloud
+    data = request.json
     
-    Expected JSON body:
-    {
-        "url": "https://youtube.com/watch?v=...",
-        "type": "audio" | "video",
-        "asset_id": "uuid-of-media-asset",
-        "artist_id": "uuid-of-artist",
-        "secret": "your-api-secret",
-        "callback_url": "https://xxx.supabase.co/functions/v1/media-callback",
-        "upload_url": "signed-supabase-upload-url",
-        "public_url": "final-public-url-after-upload",
-        "content_type": "audio/mpeg" | "video/mp4"
-    }
-    """
-    data = request.json or {}
-    callback_url = data.get('callback_url')
+    # Validate request
+    url = data.get('url')
+    media_type = data.get('type', 'audio')  # 'audio' or 'video'
     asset_id = data.get('asset_id')
+    artist_id = data.get('artist_id')
+    secret = data.get('secret')
+    callback_url = data.get('callback_url')
+    
+    # Validate secret
+    if secret != API_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    if not url or not asset_id:
+        return jsonify({"error": "Missing url or asset_id"}), 400
+    
+    # Send "downloading" status
+    if callback_url:
+        send_callback(callback_url, {
+            "asset_id": asset_id,
+            "status": "downloading",
+            "secret": API_SECRET
+        })
     
     try:
-        # Validate secret
-        if data.get('secret') != api_secret:
-            return jsonify({'error': 'Unauthorized'}), 401
-        
-        url = data.get('url')
-        media_type = data.get('type', 'audio')
-        artist_id = data.get('artist_id')
-        upload_url = data.get('upload_url')
-        public_url = data.get('public_url')
-        content_type = data.get('content_type', 'audio/mpeg')
-        
-        if not url or not asset_id or not artist_id:
-            return jsonify({'error': 'Missing required fields: url, asset_id, artist_id'}), 400
-        
-        if not callback_url:
-            return jsonify({'error': 'Missing callback_url'}), 400
-        
-        if not upload_url or not public_url:
-            return jsonify({'error': 'Missing upload_url or public_url'}), 400
-        
-        print(f"📥 Starting download: {url} as {media_type}")
-        
-        # Send "downloading" status via callback
-        send_callback(callback_url, {
-            'asset_id': asset_id,
-            'status': 'downloading',
-            'secret': api_secret
-        })
-        
-        # Create temp directory for this download
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Configure yt-dlp options based on media type
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = os.path.join(tmpdir, 'output')
+            
+            # Configure yt-dlp options
+            ydl_opts = {
+                'outtmpl': output_path + '.%(ext)s',
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            # ADD PROXY SUPPORT
+            if PROXY_URL:
+                ydl_opts['proxy'] = PROXY_URL
+                print(f"Using proxy: {PROXY_URL[:30]}...")  # Log partial URL for debugging
+            
             if media_type == 'audio':
-                output_template = os.path.join(temp_dir, f'{asset_id}.%(ext)s')
-                ydl_opts = {
+                ydl_opts.update({
                     'format': 'bestaudio/best',
-                    'outtmpl': output_template,
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
                         'preferredquality': '192',
                     }],
-                    'quiet': False,
-                    'no_warnings': False,
-                }
-                expected_ext = 'mp3'
+                })
+                bucket = 'audio-files'
+                extension = 'mp3'
             else:
-                output_template = os.path.join(temp_dir, f'{asset_id}.%(ext)s')
-                ydl_opts = {
-                    'format': 'best[height<=1080][ext=mp4]/best[height<=1080]/best',
-                    'outtmpl': output_template,
-                    'quiet': False,
-                    'no_warnings': False,
-                }
-                expected_ext = 'mp4'
+                ydl_opts.update({
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'merge_output_format': 'mp4',
+                })
+                bucket = 'media-assets'
+                extension = 'mp4'
             
             # Download with yt-dlp
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                print(f"🔄 Extracting info from {url}")
                 info = ydl.extract_info(url, download=True)
-                
                 title = info.get('title', 'Unknown')
                 duration = info.get('duration', 0)
-                thumbnail = info.get('thumbnail', None)
-                
-                print(f"✅ Downloaded: {title} ({duration}s)")
             
             # Find the downloaded file
-            downloaded_file = os.path.join(temp_dir, f'{asset_id}.{expected_ext}')
-            
-            # Check if file exists (might have different extension)
+            downloaded_file = output_path + '.' + extension
             if not os.path.exists(downloaded_file):
-                for f in os.listdir(temp_dir):
-                    if f.startswith(asset_id):
-                        downloaded_file = os.path.join(temp_dir, f)
+                # Try to find any file with the output prefix
+                for f in os.listdir(tmpdir):
+                    if f.startswith('output'):
+                        downloaded_file = os.path.join(tmpdir, f)
                         break
             
             if not os.path.exists(downloaded_file):
-                raise Exception(f"Downloaded file not found in {temp_dir}")
+                raise Exception("Downloaded file not found")
             
-            file_size = os.path.getsize(downloaded_file)
-            print(f"📁 File size: {file_size / 1024 / 1024:.2f} MB")
-            
-            # Upload to Supabase Storage using signed URL (simple PUT request!)
-            print(f"☁️ Uploading via signed URL...")
+            # Upload to Supabase Storage
+            storage_path = f"{artist_id}/{asset_id}.{extension}"
             
             with open(downloaded_file, 'rb') as f:
                 file_data = f.read()
-                
-                upload_response = requests.put(
-                    upload_url,
-                    data=file_data,
-                    headers={'Content-Type': content_type}
-                )
-                
-                if upload_response.status_code not in [200, 201]:
-                    raise Exception(f"Upload failed with status {upload_response.status_code}: {upload_response.text[:200]}")
             
-            print(f"✅ Uploaded! Public URL: {public_url}")
+            # Upload to storage
+            supabase.storage.from_(bucket).upload(
+                storage_path,
+                file_data,
+                {"content-type": f"{'audio' if media_type == 'audio' else 'video'}/{extension}"}
+            )
             
-            # Send SUCCESS callback
-            callback_payload = {
-                'asset_id': asset_id,
-                'status': 'ready',
-                'asset_url': public_url,
-                'title': title[:255] if title else None,
-                'duration': min(duration, 86400) if duration else None,
-                'secret': api_secret
-            }
+            # Get public URL
+            public_url = supabase.storage.from_(bucket).get_public_url(storage_path)
             
-            if thumbnail:
-                callback_payload['thumbnail_url'] = thumbnail
-            
-            send_callback(callback_url, callback_payload)
-            
-            print(f"✅ Callback sent for asset {asset_id}")
+            # Send success callback
+            if callback_url:
+                send_callback(callback_url, {
+                    "asset_id": asset_id,
+                    "status": "ready",
+                    "asset_url": public_url,
+                    "title": title,
+                    "duration_seconds": duration,
+                    "secret": API_SECRET
+                })
             
             return jsonify({
-                'success': True,
-                'url': public_url,
-                'title': title,
-                'duration': duration,
-                'file_size': file_size
+                "success": True,
+                "asset_id": asset_id,
+                "url": public_url,
+                "title": title,
+                "duration": duration
             })
-    
+            
     except Exception as e:
-        error_msg = str(e)[:500]
-        print(f"❌ Error: {error_msg}")
-        print(traceback.format_exc())
+        error_msg = str(e)
+        print(f"Download error: {error_msg}")
         
-        # Send FAILURE callback
-        if callback_url and asset_id:
+        # Send failure callback
+        if callback_url:
             send_callback(callback_url, {
-                'asset_id': asset_id,
-                'status': 'failed',
-                'error_message': error_msg,
-                'secret': api_secret
+                "asset_id": asset_id,
+                "status": "failed",
+                "error_message": error_msg,
+                "secret": API_SECRET
             })
         
-        return jsonify({'error': error_msg}), 500
-
-
-@app.route('/info', methods=['POST'])
-def get_info():
-    """
-    Get info about a URL without downloading
-    """
-    try:
-        data = request.json
-        
-        if data.get('secret') != api_secret:
-            return jsonify({'error': 'Unauthorized'}), 401
-        
-        url = data.get('url')
-        if not url:
-            return jsonify({'error': 'Missing url'}), 400
-        
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            return jsonify({
-                'title': info.get('title'),
-                'duration': info.get('duration'),
-                'thumbnail': info.get('thumbnail'),
-                'uploader': info.get('uploader'),
-                'view_count': info.get('view_count'),
-                'formats_available': len(info.get('formats', []))
-            })
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
+        return jsonify({"error": error_msg}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port)
